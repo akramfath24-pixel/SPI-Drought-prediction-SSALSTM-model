@@ -1,0 +1,103 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import kstest, norm, gamma, beta, expon, lognorm, weibull_min, weibull_max, pareto, cauchy, chi2, t, uniform, triang, logistic, exponnorm, skewnorm, gumbel_r, gumbel_l, laplace, powerlaw
+
+# Load data
+file_path = 'Warwick_models_test.xlsx'
+data = pd.read_excel(file_path, sheet_name='SPI3')
+
+# Extract observed and predicted data
+observed_values = data['SPI3'] #Observed Chl(a)
+predicted_values = data['WKLSTM'] #Predicted XGBoost_CNN Chl(a)
+
+# List of distributions to test
+distributions = {
+    "norm": norm,
+    "gamma": gamma,
+    "beta": beta,
+    "expon": expon,
+    "lognorm": lognorm,
+    "weibull_min": weibull_min,
+    "weibull_max": weibull_max,
+    "pareto": pareto,
+    "cauchy": cauchy,
+    "chi2": chi2,
+    "t": t,
+    "uniform": uniform,
+    "triang": triang,
+    "logistic": logistic,
+    "exponnorm": exponnorm,
+    "skewnorm": skewnorm,
+    "gumbel_r": gumbel_r,
+    "gumbel_l": gumbel_l,
+    "laplace": laplace,
+    "powerlaw": powerlaw
+}
+
+# Perform KS test for each distribution
+best_dist = None
+best_params = None
+best_p_value = -np.inf  # Initialize with a very low p-value
+
+for name, dist in distributions.items():
+    # Fit the distribution to the observed data
+    params = dist.fit(observed_values)
+    
+    # Apply KS test
+    ks_stat, p_value = kstest(observed_values, name, args=params)
+    
+    # Update best distribution if p-value is higher
+    if p_value > best_p_value:
+        best_dist = name
+        best_params = params
+        best_p_value = p_value
+
+print(f"Best-fitting distribution: {best_dist}")
+print(f"Parameters: {best_params}")
+print(f"KS Test p-value: {best_p_value:.4f}")
+
+# Generate 1000 simulations using the best-fitting distribution
+num_simulations = 1000
+simulated_noise = getattr(distributions[best_dist], "rvs")(*best_params, size=(len(predicted_values), num_simulations))
+
+simulated_noise = simulated_noise /5
+# Generate simulated predictions (centered around predicted values)
+predicted_values = np.array(predicted_values)
+simulated_predictions = predicted_values[:, None] + simulated_noise - np.mean(simulated_noise)
+
+# Calculate 2.5th and 97.5th percentiles for each index
+lower_bounds = np.percentile(simulated_predictions, 2.5, axis=1)
+upper_bounds = np.percentile(simulated_predictions, 97.5, axis=1)
+
+# Calculate d-factor and coverage probability
+d_factor = (upper_bounds - lower_bounds) / predicted_values.std()
+coverage_prob = np.mean((observed_values >= lower_bounds) & (observed_values <= upper_bounds)) * 100
+
+plt.rcParams['font.family'] = 'Times New Roman'
+
+# Plot uncertainty bounds and observed values
+plt.figure(figsize=(10, 6))
+plt.fill_between(range(len(predicted_values)), lower_bounds, upper_bounds, color=(0.0, 0.8, 0.6), alpha=0.5, label='95% Uncertainty Bounds')
+plt.plot(predicted_values, color='blue',  linewidth=0.4, label='WKLSTM Values')
+plt.scatter(range(len(observed_values)), observed_values, color='red', marker='.', s=20, label='Monitoring Values')
+plt.xlabel("Sample Index", fontsize=16)
+plt.ylabel("SPI3", fontsize=16) #(µg/l)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.title(f"Warwick-95% Uncertainty Bounds with {best_dist.capitalize()} Distribution", fontsize=16)
+
+mean_d_factor = np.mean(d_factor)  # Calculate the mean d-factor for display
+plt.text(0.05, 0.95, f"d-factor: {mean_d_factor:.2f}", transform=plt.gca().transAxes, 
+       fontsize=16, verticalalignment='top', fontname="Times New Roman", color='black')
+
+plt.text(0.05, 0.85, f"Coverage Probability: {coverage_prob:.2f}%", transform=plt.gca().transAxes, 
+         fontsize=16, verticalalignment='center', fontname="Times New Roman", color='black')
+
+plt.legend(fontsize=14)
+plt.grid()
+plt.show()
+
+# Display d-factor and coverage probability
+print(f"Mean d-factor: {np.mean(d_factor):.2f}")
+print(f"Coverage Probability: {coverage_prob:.2f}%")
