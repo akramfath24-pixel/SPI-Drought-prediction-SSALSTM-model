@@ -1,0 +1,422 @@
+import pandas as pd
+import numpy as np
+import optuna
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l1_l2
+from sklearn.model_selection import train_test_split
+
+# ==============================================
+# SSA DECOMPOSITION
+# ==============================================
+def ssa_decompose(signal, window_length=10, n_components=None):
+    """Singular Spectrum Analysis decomposition"""
+    try:
+        n = len(signal)
+        if n < window_length:
+            raise ValueError(f"Signal length ({n}) is less than window length ({window_length})")
+        if not np.all(np.isfinite(signal)):
+            raise ValueError("Signal contains NaN or non-numeric values")
+
+        # Embedding step: Create trajectory matrix
+        K = window_length
+        L = n - K + 1
+        X = np.array([signal[i:i+K] for i in range(L)]).T  # Shape: (K, L)
+
+        # SVD step
+        U, s, Vt = np.linalg.svd(X, full_matrices=False)
+        
+        # Determine number of components to keep
+        if n_components is None:
+            n_components = min(K, L)
+        else:
+            n_components = min(n_components, K, L)
+        
+        # Reconstruct individual components using diagonal averaging
+        processed_modes = []
+        for i in range(n_components):
+            Xi = np.outer(U[:, i] * s[i], Vt[i, :])
+            
+            # Improved diagonal averaging
+            mode = np.zeros(n)
+            counts = np.zeros(n)
+            
+            for j in range(L):
+                for k in range(K):
+                    idx = j + k
+                    if idx < n:
+                        mode[idx] += Xi[k, j]
+                        counts[idx] += 1
+            
+            # Avoid division by zero
+            counts[counts == 0] = 1
+            mode = mode / counts
+            
+            processed_modes.append(mode)
+
+        return np.array(processed_modes)
+    except Exception as e:
+        print(f"SSA failed for signal: {str(e)}, using original signal")
+        return np.array([signal])
+
+# ==============================================
+# DATA LOADING AND PREPROCESSING
+# ==============================================
+def load_data(file_path, sheet_name):
+    """Load and verify dataset"""
+    try:
+        data = pd.read_excel(file_path, sheet_name=sheet_name)
+        required_columns = ['SPI3(t)', 'SPI3(t+1)']
+        
+        if not all(col in data.columns for col in required_columns):
+            missing_cols = [col for col in required_columns if col not in data.columns]
+            raise ValueError(f"Missing columns in dataset: {missing_cols}")
+        
+        X = data[['SPI3(t)']].values
+        y = data['SPI3(t+1)'].values
+        
+        # Check for non-numeric or NaN values
+        if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
+            raise ValueError("Input data contains NaN or non-numeric values")
+        
+        print(f"Initial data shapes - X: {X.shape}, y: {y.shape}")
+        assert len(X) == len(y), "X and y must have same length"
+        return X, y
+    except Exception as e:
+        print(f"Data loading failed: {str(e)}")
+        raise
+
+# ==============================================
+# MODEL EVALUATION METRICS
+# ==============================================
+def calculate_metrics(y_true, y_pred):
+    """Calculate comprehensive evaluation metrics"""
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    nse = 1 - (np.sum((y_true - y_pred) ** 2) / np.sum((y_true - np.mean(y_true)) ** 2))
+    sde = np.std(y_true - y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-10))) * 100
+    pbias = np.sum(y_true - y_pred) / np.sum(y_true + 1e-10) * 100
+    return rmse, mae, mse, r2, nse, sde, mape, pbias
+
+# ==============================================
+# 3D VISUALIZATION OF SSA COMPONENTS
+# ==============================================
+def plot_3d_components(time, components, feature_name, elev=30, azim=-75):
+    """3D plot of SSA components"""
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    for j, mode in enumerate(components):
+        ax.plot(time, np.full_like(time, j + 1), mode, label=f'Component {j + 1}')
+    
+    # Set labels with font properties
+    ax.set_xlabel('Time Index', fontsize=22, fontfamily="Times New Roman", labelpad=15)
+    ax.set_ylabel('Component Index', fontsize=22, fontfamily="Times New Roman", labelpad=15)
+    ax.set_zlabel('Component Amplitude', fontsize=22, fontfamily="Times New Roman", labelpad=15)
+    
+    # Set title
+    ax.set_title(f'SSA Components for {feature_name}_Warwick', fontsize=20, fontfamily="Times New Roman", fontweight='bold')
+    
+    for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+       axis.set_tick_params(labelsize=20)
+       for label in axis.get_ticklabels():
+           label.set_family("Times New Roman")
+           
+           # Set tick label font size for all axes
+           ax.tick_params(axis='x', labelsize=20)
+           ax.tick_params(axis='y', labelsize=20)
+           ax.tick_params(axis='z', labelsize=20)
+    
+    # Set view angle
+    ax.view_init(elev=elev, azim=azim)
+    
+   # plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# ==============================================
+# OPTUNA OPTIMIZATION
+# ==============================================
+def objective(trial, X, y):
+    """Objective function for Optuna optimization"""
+    try:
+        # SSA parameters
+        window_length = trial.suggest_int('window_length', 5, min(20, len(X)//2))
+        n_components = trial.suggest_int('n_components', 2, min(15, window_length))
+        
+        # LSTM parameters
+        num_layers = trial.suggest_int('num_layers', 1, 3)
+        params = {
+            'num_layers': num_layers,
+            'units_layer1': trial.suggest_int('units_layer1', 32, 256),
+            'units_layer2': trial.suggest_int('units_layer2', 32, 256) if num_layers >= 2 else 0,
+            'units_layer3': trial.suggest_int('units_layer3', 32, 256) if num_layers >= 3 else 0,
+            'dropout_rate': trial.suggest_float('dropout_rate', 0.1, 0.4),
+            'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
+            'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64]),
+            'l1_reg': trial.suggest_float('l1_reg', 1e-9, 1e-2, log=True),
+            'l2_reg': trial.suggest_float('l2_reg', 1e-9, 1e-2, log=True),
+        }
+
+        # SSA decomposition
+        X_modes = []
+        for i in range(X.shape[1]):
+            modes = ssa_decompose(X[:, i], window_length=window_length, n_components=n_components)
+            X_modes.append(modes)
+        
+        X_combined = np.concatenate(X_modes, axis=0).T
+        
+        # Data splitting
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_combined, y, test_size=0.3, shuffle=False)
+        
+        # Normalization
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+        X_train = scaler_X.fit_transform(X_train)
+        X_test = scaler_X.transform(X_test)
+        y_train = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
+        y_test = scaler_y.transform(y_test.reshape(-1, 1)).flatten()
+
+        # Reshape for LSTM [samples, timesteps, features]
+        X_train = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+        X_test = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
+
+        # Build LSTM model
+        model = Sequential()
+        for i in range(1, params['num_layers'] + 1):
+            return_sequences = i < params['num_layers']
+            model.add(LSTM(
+                units=params[f'units_layer{i}'],
+                return_sequences=return_sequences,
+                kernel_regularizer=l1_l2(l1=params['l1_reg'], l2=params['l2_reg']),
+                input_shape=(X_train.shape[1], X_train.shape[2]) if i == 1 else None
+            ))
+            model.add(Dropout(params['dropout_rate']))
+
+        model.add(Dense(1))
+        optimizer = Adam(learning_rate=params['learning_rate'])
+        model.compile(optimizer=optimizer, loss='mse')
+
+        early_stopping = EarlyStopping(monitor='loss', patience=20, restore_best_weights=True)
+
+        model.fit(
+            X_train, y_train,
+            batch_size=params['batch_size'],
+            callbacks=[early_stopping],
+            verbose=0
+        )
+
+        y_pred = model.predict(X_test, verbose=0).flatten()
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        return rmse
+        
+    except Exception as e:
+        print(f"Trial failed: {str(e)}")
+        return float('inf')
+
+# ==============================================
+# MAIN EXECUTION
+# ==============================================
+def main():
+    # Load data
+    try:
+        X, y = load_data('Warwick.xlsx', 'SPI3')
+    except Exception as e:
+        print(f"Failed to load data: {str(e)}")
+        return
+
+    # Configure Optuna study
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(
+            n_warmup_steps=10,
+            n_min_trials=20,
+            interval_steps=5
+        )
+    )
+
+    # Optimization
+    print("Starting optimization...")
+    study.optimize(
+        lambda trial: objective(trial, X, y),
+        n_trials=50,
+        n_jobs=1,
+        show_progress_bar=True
+    )
+
+    # Check optimization results
+    if study.best_value == float('inf'):
+        print("All trials failed. Check error messages.")
+        return
+
+    # Best parameters
+    best_params = study.best_params
+    print("\nBest parameters found:")
+    for k, v in best_params.items():
+        print(f"{k}: {v}")
+
+    # Full pipeline with best parameters
+    feature_names = ['SPI3(t)']
+    X_modes = []
+    
+    # Decompose each feature
+    for i in range(X.shape[1]):
+        modes = ssa_decompose(X[:, i], 
+                             window_length=best_params['window_length'], 
+                             n_components=best_params['n_components'])
+        X_modes.append(modes)
+        
+        # Visualization - 2D plot
+        plt.figure(figsize=(15, 10))
+        plt.subplot(len(modes) + 1, 1, 1)
+        plt.plot(X[:, i], 'k')
+        plt.title(f'Original Signal ({feature_names[i]})')
+        
+        for j, mode in enumerate(modes):
+            plt.subplot(len(modes) + 1, 1, j + 2)
+            plt.plot(mode, 'b')
+            plt.title(f'Component {j + 1}')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 3D Visualization of components
+        plot_3d_components(np.arange(len(X[:, i])), modes, feature_names[i])
+    
+    X_combined = np.concatenate(X_modes, axis=0).T
+    
+    # Data processing
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    X_norm = scaler_X.fit_transform(X_combined)
+    y_norm = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+    
+    # Final train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_norm, y_norm, test_size=0.3, shuffle=False)
+    
+    # Reshape for LSTM [samples, timesteps, features]
+    X_train = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+    X_test = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
+
+    # Train final model
+    final_model = Sequential()
+    for i in range(1, best_params['num_layers'] + 1):
+        return_sequences = i < best_params['num_layers']
+        final_model.add(LSTM(
+            units=best_params[f'units_layer{i}'],
+            return_sequences=return_sequences,
+            kernel_regularizer=l1_l2(l1=best_params['l1_reg'], l2=best_params['l2_reg']),
+            input_shape=(X_train.shape[1], X_train.shape[2]) if i == 1 else None
+        ))
+        final_model.add(Dropout(best_params['dropout_rate']))
+
+    final_model.add(Dense(1))
+    optimizer = Adam(learning_rate=best_params['learning_rate'])
+    final_model.compile(optimizer=optimizer, loss='mse')
+
+    early_stopping = EarlyStopping(monitor='loss', patience=20, restore_best_weights=True)
+
+    history = final_model.fit(
+        X_train, y_train,
+        batch_size=best_params['batch_size'],
+        callbacks=[early_stopping],
+        verbose=1
+    )
+
+    # Predictions
+    y_pred_train = final_model.predict(X_train, verbose=0).flatten()
+    y_pred_test = final_model.predict(X_test, verbose=0).flatten()
+    
+    # Un-normalize
+    y_train = scaler_y.inverse_transform(y_train.reshape(-1, 1)).flatten()
+    y_test = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    y_pred_train = scaler_y.inverse_transform(y_pred_train.reshape(-1, 1)).flatten()
+    y_pred_test = scaler_y.inverse_transform(y_pred_test.reshape(-1, 1)).flatten()
+
+    # Calculate metrics
+    train_metrics = dict(zip(
+        ['RMSE', 'MAE', 'MSE', 'R2', 'NSE', 'SDE', 'MAPE', 'PBIAS'],
+        calculate_metrics(y_train, y_pred_train)
+    ))
+
+    test_metrics = dict(zip(
+        ['RMSE', 'MAE', 'MSE', 'R2', 'NSE', 'SDE', 'MAPE', 'PBIAS'],
+        calculate_metrics(y_test, y_pred_test)
+    ))
+
+    print("\nTraining Metrics:")
+    for name, value in train_metrics.items():
+        print(f"{name}: {value:.4f}")
+    
+    print("\nTesting Metrics:")
+    for name, value in test_metrics.items():
+        print(f"{name}: {value:.4f}")
+
+    # Plot results
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.scatter(y_train, y_pred_train, color='purple', alpha=0.6)
+    plt.plot([min(y_train), max(y_train)], [min(y_train), max(y_train)], 'k--')
+    plt.xlabel('Observed SPI3(t+1)')
+    plt.ylabel('Predicted SPI3(t+1)')
+    plt.title('Training Set Performance')
+
+    plt.subplot(1, 2, 2)
+    plt.scatter(y_test, y_pred_test, color='red', alpha=0.6)
+    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], 'k--')
+    plt.xlabel('Observed SPI3(t+1)')
+    plt.ylabel('Predicted SPI3(t+1)')
+    plt.title('Testing Set Performance')
+    plt.tight_layout()
+    plt.show()
+
+    # Time series plot
+    plt.figure(figsize=(12, 6))
+    plt.plot(y_test, label='Observed', color='blue')
+    plt.plot(y_pred_test, label='Predicted', color='red', linestyle='--')
+    plt.title('SPI3(t+1) Forecasting Results')
+    plt.xlabel('Time')
+    plt.ylabel('SPI3(t+1) Value')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    # Save results
+    results_df_train = pd.DataFrame({
+        'Actual': y_train,
+        'Predicted': y_pred_train
+    })
+
+    results_df_test = pd.DataFrame({
+        'Actual': y_test,
+        'Predicted': y_pred_test
+    })
+
+    metrics_df = pd.DataFrame({
+        'Metric': ['RMSE', 'MAE', 'MSE', 'R²', 'NSE', 'SDE', 'MAPE', 'PBIAS'],
+        'Train': [train_metrics[m] for m in ['RMSE', 'MAE', 'MSE', 'R2', 'NSE', 'SDE', 'MAPE', 'PBIAS']],
+        'Test': [test_metrics[m] for m in ['RMSE', 'MAE', 'MSE', 'R2', 'NSE', 'SDE', 'MAPE', 'PBIAS']]
+    })
+
+    with pd.ExcelWriter("SSA_LSTM_SPI12_W.xlsx") as writer:
+        results_df_train.to_excel(writer, sheet_name="Train Predictions", index=False)
+        results_df_test.to_excel(writer, sheet_name="Test Predictions", index=False)
+        metrics_df.to_excel(writer, sheet_name="Metrics", index=False)
+        pd.DataFrame([best_params]).to_excel(writer, sheet_name="Best Parameters", index=False)
+
+    #print("\nResults saved to SSA_LSTM_SPI9_SC.xlsx")
+
+if __name__ == "__main__":
+    main()
