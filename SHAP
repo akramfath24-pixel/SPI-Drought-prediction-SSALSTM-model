@@ -1,0 +1,358 @@
+import pandas as pd
+import xgboost as xgb
+import shap
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib import cm
+import os
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# Load the data
+file_path = 'Warwick.xlsx'  # Update with your file path if needed
+try:
+    data = pd.read_excel(file_path, sheet_name='SPI3')
+except FileNotFoundError:
+    print(f"Error: File '{file_path}' not found. Please provide the correct path.")
+    exit(1)
+except Exception as e:
+    print(f"Error loading file: {e}")
+    exit(1)
+
+# Check for missing values
+if data.isnull().any().any():
+    print("Warning: Missing values detected. Consider handling them before proceeding.")
+    data = data.fillna(data.mean())  # Simple imputation; adjust as needed
+
+# Define input features and target variable
+X = data.drop(columns=['SPI3(t+1)'])
+y = data['SPI3(t+1)']
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+# Scale the data
+scaler_X = MinMaxScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+
+# Convert scaled arrays back to DataFrames to preserve feature names
+X_train_scaled = pd.DataFrame(X_train_scaled, columns=X.columns)
+X_test_scaled = pd.DataFrame(X_test_scaled, columns=X.columns)
+
+# Train an XGBoost model
+try:
+    model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
+    model.fit(X_train_scaled, y_train)
+except Exception as e:
+    print(f"Error training model: {e}")
+    exit(1)
+
+# Initialize SHAP explainer
+explainer = shap.TreeExplainer(model)  # Use TreeExplainer for XGBoost
+
+# Calculate SHAP values
+shap_values = explainer(X_test_scaled)
+
+# Define custom color (converted RGB to hex for clarity)
+custom_color = '#F78278'  # Equivalent to [0.97000, 0.510000, 0.470000]
+
+# =====================================================================
+# 1. SHAP Summary Plot (Bee Swarm Plot)
+# =====================================================================
+plt.figure(figsize=(10, 6))
+shap.summary_plot(
+    shap_values,
+    X_test_scaled,
+    feature_names=X.columns,
+    show=False
+)
+plt.xlabel(plt.gca().get_xlabel(), fontsize=19, fontname="Times New Roman")
+plt.ylabel(plt.gca().get_ylabel(), fontsize=20, fontname="Times New Roman")
+plt.xticks(fontsize=20, fontname="Times New Roman")
+plt.yticks(fontsize=20, fontname="Times New Roman")
+plt.title("Warwick - SHAP Summary Plot", fontsize=22, fontweight='bold', fontname="Times New Roman")
+plt.show()
+
+# =====================================================================
+# 2. SHAP Bar Plot (Feature Importance)
+# =====================================================================
+plt.figure(figsize=(10, 6))
+shap.summary_plot(
+    shap_values,
+    X_test_scaled,
+    plot_type="bar",
+    feature_names=X.columns,
+    color=custom_color,
+    show=False
+)
+plt.xlabel(plt.gca().get_xlabel(), fontsize=18, fontname="Times New Roman")
+plt.ylabel(plt.gca().get_ylabel(), fontsize=20, fontname="Times New Roman")
+plt.xticks(fontsize=20, fontname="Times New Roman")
+plt.yticks(fontsize=20, fontname="Times New Roman")
+plt.title("Warwick - Feature Importance", fontsize=22, fontweight='bold', fontname="Times New Roman")
+plt.show()
+
+# =====================================================================
+# 3. SHAP Dependence Plots (Top 3 Features)
+# =====================================================================
+
+shap_df = pd.DataFrame(shap_values.values, columns=X.columns)
+mean_shap_df = pd.DataFrame({
+    'Feature': X.columns,
+    'Mean SHAP Value': np.abs(shap_df).mean(axis=0)
+}).sort_values('Mean SHAP Value', ascending=False)
+
+top_features = mean_shap_df['Feature'].head(3)
+
+plt.figure(figsize=(10, 8))
+for i, feature in enumerate(top_features, 1):
+    #plt.subplot(3, 2, i)
+    shap.dependence_plot(
+        feature,
+        shap_values.values,
+        X_test_scaled,
+        feature_names=X.columns,
+        interaction_index=None,
+        show=False
+    )
+    plt.title(f"Dependence Plot: {feature}", fontsize=18, fontname="Times New Roman")
+    plt.suptitle("Warwick", fontsize=18, fontweight='bold', fontname="Times New Roman", y=1.02)
+    plt.xlabel(feature, fontsize=18, fontname="Times New Roman")
+    plt.ylabel("SHAP Value", fontsize=18, fontname="Times New Roman")
+    plt.xticks(fontsize=16, fontname="Times New Roman")
+    plt.yticks(fontsize=16, fontname="Times New Roman")
+
+plt.tight_layout()
+#plt.suptitle("SHAP Dependence Plots (Top 2 Features)", fontsize=16, fontweight='bold', fontname="Times New Roman", y=1.02)
+plt.show()
+
+
+# =====================================================================
+# 5. SHAP Interaction Plots (Top 3 Feature Pairs)
+# =====================================================================
+plt.figure(figsize=(10, 5))
+top_interactions = [(top_features[0], top_features[1]),
+                    (top_features[0], top_features[2]),
+                    (top_features[1], top_features[2])]
+
+for i, (f1, f2) in enumerate(top_interactions, 1):
+    #plt.subplot(2, 2, i)
+    shap.dependence_plot(
+        f1,
+        shap_values.values,
+        X_test_scaled,
+        feature_names=X.columns,
+        interaction_index=f2,
+        show=False
+    )
+    plt.title(f"Interaction: {f1} & {f2}", fontsize=18, fontname="Times New Roman")
+    plt.suptitle("Warwick", fontsize=18, fontweight='bold', fontname="Times New Roman", y=1.02)
+    plt.xlabel(f1, fontsize=18, fontname="Times New Roman")
+    plt.ylabel("SHAP Value", fontsize=18, fontname="Times New Roman")
+    plt.xticks(fontsize=16, fontname="Times New Roman")
+    plt.yticks(fontsize=16, fontname="Times New Roman")
+
+plt.tight_layout()
+plt.suptitle("SHAP Interaction Plots", fontsize=18, fontweight='bold', fontname="Times New Roman", y=1.02)
+plt.show()
+
+
+# =====================================================================
+# 5. ENHANCED SHAP INTERACTION PLOTS WITH ANNOTATIONS AND HISTOGRAMS
+# =====================================================================
+
+# =====================================================================
+# 5. SHAP INTERACTION PLOTS (Simplified Version)
+# =====================================================================
+
+# Calculate interaction values
+shap_interaction = explainer.shap_interaction_values(X_test_scaled)
+
+# Get top 3 features
+top_features = mean_shap_df['Feature'].head(3).tolist()
+
+# Create all possible pairs from top 3 features
+interaction_pairs = [(top_features[0], top_features[1]),
+                    (top_features[0], top_features[2]), 
+                    (top_features[1], top_features[2])]
+
+# Custom plot settings
+cmap = plt.cm.coolwarm
+plot_font = {'fontname': 'Times New Roman', 'fontsize': 22}
+title_font = {'fontname': 'Times New Roman', 'fontweight': 'bold', 'fontsize': 22}
+annotation_font = {'fontname': 'Times New Roman', 'fontsize': 22}
+
+for f1, f2 in interaction_pairs:
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    
+    # Get interaction values
+    interaction_vals = shap_interaction[:, X.columns.get_loc(f1), X.columns.get_loc(f2)]
+    
+    # Create contour plot
+    cntr = plt.tricontourf(
+        X_test_scaled[f1],
+        X_test_scaled[f2], 
+        interaction_vals,
+        levels=20,
+        cmap=cmap,
+        alpha=0.8
+    )
+    
+    # Add scatter points
+    plt.scatter(X_test_scaled[f1], X_test_scaled[f2],
+               c=interaction_vals,
+               cmap=cmap,
+               alpha=0.2,
+               s=20,
+               edgecolors='none')
+    
+    # Add colorbar
+    cbar = plt.colorbar(cntr)
+    cbar.set_label('SHAP Interaction Value', **plot_font)
+    cbar.ax.tick_params(labelsize=20)
+    
+    # Find and annotate key interaction points
+    max_pos_idx = np.argmax(interaction_vals)
+    max_neg_idx = np.argmin(interaction_vals)
+    
+    plt.annotate('Max Positive Interaction',
+                xy=(X_test_scaled[f1].iloc[max_pos_idx], X_test_scaled[f2].iloc[max_pos_idx]),
+                xytext=(0.5, 0.35), textcoords='axes fraction',
+                arrowprops=dict(facecolor='black', shrink=0.05),
+                bbox=dict(boxstyle='round', fc='yellow', alpha=0.5),
+                **annotation_font)
+    
+    plt.annotate('Max Negative Interaction',
+                xy=(X_test_scaled[f1].iloc[max_neg_idx], X_test_scaled[f2].iloc[max_neg_idx]),
+                xytext=(0.1, 0.1), textcoords='axes fraction',
+                arrowprops=dict(facecolor='black', shrink=0.05),
+                bbox=dict(boxstyle='round', fc='lightblue', alpha=0.5),
+                **annotation_font)
+    
+    # Calculate and display interaction statistics
+    interaction_strength = np.mean(np.abs(interaction_vals))
+    h_statistic = (np.sum(interaction_vals**2) / 
+                  (np.sum(interaction_vals**2) + np.sum(shap_values.values**2)))**0.5
+    
+    stats_text = (f"Interaction Strength: {interaction_strength:.3f}\n"
+                 f"H-statistic: {h_statistic:.3f}\n"
+                 f"Max Positive: {np.max(interaction_vals):.3f}\n"
+                 f"Max Negative: {np.min(interaction_vals):.3f}")
+    
+    plt.gcf().text(0.3, 0.7, stats_text, ha='center',
+                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                  **plot_font)
+    
+    # Formatting
+    #plt.title(f"Interaction: {f1} & {f2}\nLockyer Valley", **title_font, pad=20)
+    plt.title(f"Interaction: {f1} & {f2}", 
+             fontsize=22, 
+             fontname="Times New Roman",
+             pad=10)
+    plt.suptitle("Warwick", fontsize=24, fontweight='bold', fontname="Times New Roman", y=1.02)
+    plt.xlabel(f1, **plot_font)
+    plt.ylabel(f2, **plot_font)
+    plt.xticks(**plot_font)
+    plt.yticks(**plot_font)
+    plt.grid(True, linestyle=':', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Save plot
+   # output_file = f"SHAP_Interaction_{f1}_vs_{f2}.png"
+    #plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    #print(f"Saved: {output_file}")
+    
+    
+    # =====================================================================
+# 5. SHAP OUTPUT INTERACTION PLOTS (Input Features vs Target)
+# =====================================================================
+
+# Calculate SHAP values if not already done
+shap_values = explainer(X_test_scaled)
+
+# Get top features based on mean absolute SHAP values
+mean_shap_df = pd.DataFrame({
+    'Feature': X.columns,
+    'Mean_SHAP': np.abs(shap_values.values).mean(axis=0)
+}).sort_values('Mean_SHAP', ascending=False)
+
+top_features = mean_shap_df['Feature'].head(3).tolist()
+
+# Custom plot settings
+plt.style.use('default')
+cmap = plt.cm.coolwarm
+font_settings = {'fontname': 'Times New Roman', 'fontsize': 14}
+title_font = {'fontname': 'Times New Roman', 'fontweight': 'bold', 'fontsize': 16}
+
+# Create individual plots for each top feature vs output
+for feature in top_features:
+    plt.figure(figsize=(10, 6))
+    
+    # Get feature values and corresponding SHAP values
+    x_vals = X_test_scaled[feature]
+    y_vals = shap_values.values[:, X.columns.get_loc(feature)]
+    actual_output = y_test.values  # Actual SPI3(t+1) values
+    
+    # Create scatter plot with color mapping to actual output
+    scatter = plt.scatter(x_vals, y_vals, 
+                         c=actual_output, 
+                         cmap=cmap,
+                         alpha=0.7,
+                         s=50,
+                         edgecolor='w',
+                         linewidth=0.5)
+    
+    # Add regression line to show trend
+    z = np.polyfit(x_vals, y_vals, 1)
+    p = np.poly1d(z)
+    plt.plot(x_vals, p(x_vals), 
+            color='black', 
+            linestyle='--', 
+            linewidth=2,
+            label='Trend line')
+    
+    # Add colorbar for actual output values
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Actual SPI3(t+1)', **font_settings)
+    
+    # Add annotations
+    corr_coef = np.corrcoef(x_vals, y_vals)[0,1]
+    plt.annotate(f'Pearson r = {corr_coef:.2f}',
+                xy=(0.05, 0.95), 
+                xycoords='axes fraction',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                **font_settings)
+    
+    # Formatting
+    plt.title(f"SHAP Interaction: {feature} vs SPI3(t+1)\nWarwick", **title_font, pad=20)
+    plt.xlabel(f"Normalized {feature}", **font_settings)
+    plt.ylabel("SHAP Value", **font_settings)
+    plt.legend(loc='upper right')
+    plt.grid(True, linestyle=':', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Save plot
+    output_file = f"SHAP_Interaction_{feature}_vs_output.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Saved: {output_file}")
+
+# =====================================================================
+# 6. Save SHAP Values to Excel
+# =====================================================================
+output_file = "shap_values_SPI9(t+1)_R.xlsx"
+try:
+    with pd.ExcelWriter(output_file) as writer:
+        shap_df.to_excel(writer, sheet_name="SHAP Values", index=False)
+        mean_shap_df.to_excel(writer, sheet_name="Mean SHAP Values", index=False)
+    print(f"Analysis complete. SHAP values saved to '{output_file}'")
+except Exception as e:
+    print(f"Error saving SHAP values to Excel: {e}")
